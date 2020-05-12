@@ -71,6 +71,10 @@ type Pusher struct {
 	username, password string
 
 	expfmt expfmt.Format
+
+	// JWT specific
+	useJWT   bool
+	jwtToken string
 }
 
 // New creates a new Pusher to push to the provided URL with the provided job
@@ -104,6 +108,7 @@ func New(url, job string) *Pusher {
 		registerer: reg,
 		client:     &http.Client{},
 		expfmt:     expfmt.FmtProtoDelim,
+		useJWT:     false,
 	}
 }
 
@@ -117,6 +122,12 @@ func New(url, job string) *Pusher {
 // Push returns the first error encountered by any method call (including this
 // one) in the lifetime of the Pusher.
 func (p *Pusher) Push() error {
+	_, err := p.push("PUT")
+	return err
+}
+
+// PushJWT - Same as original Push() but retruns beside error the status
+func (p *Pusher) PushWithToken() (int, error) {
 	return p.push("PUT")
 }
 
@@ -124,7 +135,8 @@ func (p *Pusher) Push() error {
 // (and the same job and other grouping labels) will be replaced. (It uses HTTP
 // method “POST” to push to the Pushgateway.)
 func (p *Pusher) Add() error {
-	return p.push("POST")
+	_, err := p.push("POST")
+	return err
 }
 
 // Gatherer adds a Gatherer to the Pusher, from which metrics will be gathered
@@ -194,6 +206,18 @@ func (p *Pusher) BasicAuth(username, password string) *Pusher {
 	return p
 }
 
+// Enable JWT
+func (p *Pusher) SetJwtEnable(en bool) *Pusher {
+	p.useJWT = en
+	return p
+}
+
+// Set JWT Token
+func (p *Pusher) SetJwtToken(token string) *Pusher {
+	p.jwtToken = token
+	return p
+}
+
 // Format configures the Pusher to use an encoding format given by the
 // provided expfmt.Format. The default format is expfmt.FmtProtoDelim and
 // should be used with the standard Prometheus Pushgateway. Custom
@@ -204,9 +228,9 @@ func (p *Pusher) Format(format expfmt.Format) *Pusher {
 	return p
 }
 
-func (p *Pusher) push(method string) error {
+func (p *Pusher) push(method string) (int, error) {
 	if p.error != nil {
-		return p.error
+		return http.StatusBadRequest, p.error
 	}
 	urlComponents := []string{url.QueryEscape(p.job)}
 	for ln, lv := range p.grouping {
@@ -216,7 +240,7 @@ func (p *Pusher) push(method string) error {
 
 	mfs, err := p.gatherers.Gather()
 	if err != nil {
-		return err
+		return http.StatusBadRequest, err
 	}
 	buf := &bytes.Buffer{}
 	enc := expfmt.NewEncoder(buf, p.expfmt)
@@ -225,10 +249,10 @@ func (p *Pusher) push(method string) error {
 		for _, m := range mf.GetMetric() {
 			for _, l := range m.GetLabel() {
 				if l.GetName() == "job" {
-					return fmt.Errorf("pushed metric %s (%s) already contains a job label", mf.GetName(), m)
+					return http.StatusBadRequest, fmt.Errorf("pushed metric %s (%s) already contains a job label", mf.GetName(), m)
 				}
 				if _, ok := p.grouping[l.GetName()]; ok {
-					return fmt.Errorf(
+					return http.StatusBadRequest, fmt.Errorf(
 						"pushed metric %s (%s) already contains grouping label %s",
 						mf.GetName(), m, l.GetName(),
 					)
@@ -239,20 +263,29 @@ func (p *Pusher) push(method string) error {
 	}
 	req, err := http.NewRequest(method, pushURL, buf)
 	if err != nil {
-		return err
+		return http.StatusBadRequest, err
 	}
 	if p.useBasicAuth {
 		req.SetBasicAuth(p.username, p.password)
 	}
+
+	// if JWT enable adds jwtToken to the URL
+	if p.useJWT {
+		q := req.URL.Query()
+		q.Add("auth", p.jwtToken)
+
+		req.URL.RawQuery = q.Encode()
+	}
+
 	req.Header.Set(contentTypeHeader, string(p.expfmt))
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return err
+		return http.StatusBadRequest, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 202 {
 		body, _ := ioutil.ReadAll(resp.Body) // Ignore any further error as this is for an error message only.
-		return fmt.Errorf("unexpected status code %d while pushing to %s: %s", resp.StatusCode, pushURL, body)
+		return resp.StatusCode, fmt.Errorf("unexpected status code %d while pushing to %s: %s", resp.StatusCode, pushURL, body)
 	}
-	return nil
+	return http.StatusBadRequest, nil
 }
